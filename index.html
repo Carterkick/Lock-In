@@ -193,6 +193,11 @@ nav.tabs .in{display:grid;grid-template-columns:repeat(6,1fr);width:100%;max-wid
 /* Storage                                                           */
 /* ---------------------------------------------------------------- */
 const KEY = "lockin-v1";
+const SYNC_KEY = "lockin-sync-v1";
+// Public by design: this is the VAPID public key for the sync worker below,
+// safe to commit. Set after deploying the worker (see README.md). The
+// private half lives only as a Worker secret.
+const VAPID_PUBLIC_KEY = "BGVrlFWKzmiei0LhmeVQ0m63Ip4QBGh3qxWgfB96SxzITe_4ko83rpD4xJvFlHtkxPxlDuaoq2gzBw6HX1SiS5k";
 const DAYL = ["S","M","T","W","T","F","S"];
 const FULL = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
 const ALL = [0,1,2,3,4,5,6], WEEK = [1,2,3,4,5];
@@ -308,9 +313,156 @@ function save(){
   saveT = setTimeout(() => {
     try { localStorage.setItem(KEY, JSON.stringify(S)); saveErr = false; }
     catch(e){ saveErr = true; renderBanners(); }
+    queueCloudBackup();
   }, 250);
 }
 function commit(){ save(); render(); }
+
+/* ---------------------------------------------------------------- */
+/* Cloud sync: push notifications that reach a closed app, and a backup */
+/* that happens without being asked. Kept entirely separate from S, so */
+/* the worker URL and shared secret never end up in an exported backup */
+/* file or get overwritten by restoring one.                           */
+/* ---------------------------------------------------------------- */
+let SYNC;
+try { SYNC = JSON.parse(localStorage.getItem(SYNC_KEY)) || { url:"", secret:"" }; }
+catch(e){ SYNC = { url:"", secret:"" }; }
+function saveSync(){ try{ localStorage.setItem(SYNC_KEY, JSON.stringify(SYNC)); }catch(e){} }
+function syncConfigured(){ return !!(SYNC.url && SYNC.secret); }
+
+function isStandalone(){
+  try { return (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches) || navigator.standalone===true; }
+  catch(e){ return false; }
+}
+function isIOS(){ return /iPad|iPhone|iPod/.test(navigator.userAgent) && !window.MSStream; }
+
+function urlBase64ToUint8Array(base64String){
+  const padding = "=".repeat((4 - base64String.length % 4) % 4);
+  const base64 = (base64String + padding).replace(/-/g,"+").replace(/_/g,"/");
+  const raw = atob(base64);
+  const out = new Uint8Array(raw.length);
+  for(let i=0;i<raw.length;i++) out[i] = raw.charCodeAt(i);
+  return out;
+}
+
+// Fails soft, on purpose: every caller below treats a rejected promise as
+// "try again later" and never blocks the UI on it.
+function syncFetch(path, opts){
+  opts = opts || {};
+  if(!syncConfigured()) return Promise.reject(new Error("not configured"));
+  const ctrl = ("AbortController" in window) ? new AbortController() : null;
+  const t = ctrl ? setTimeout(()=>ctrl.abort(), 12000) : null;
+  const base = SYNC.url.replace(/\/+$/,"");
+  const headers = Object.assign({Authorization:"Bearer "+SYNC.secret}, opts.body!==undefined ? {"Content-Type":"application/json"} : {});
+  return fetch(base+path, {
+    method: opts.method || "GET",
+    headers,
+    body: opts.body!==undefined ? JSON.stringify(opts.body) : undefined,
+    signal: ctrl ? ctrl.signal : undefined
+  }).then(res => {
+    if(t) clearTimeout(t);
+    if(!res.ok) return res.json().catch(()=>({})).then(j => { const e = new Error(j.error||("http "+res.status)); e.status = res.status; throw e; });
+    return res;
+  }, err => { if(t) clearTimeout(t); throw err; });
+}
+
+let cloudPushT, cloudRetryT, cloudLastErr = null;
+function queueCloudBackup(){
+  if(!syncConfigured()) return;
+  clearTimeout(cloudPushT);
+  cloudPushT = setTimeout(pushStateToCloud, 4000);
+}
+function pushStateToCloud(){
+  if(!syncConfigured()) return Promise.resolve();
+  clearTimeout(cloudRetryT);
+  return syncFetch("/state", { method:"POST", body:S }).then(() => {
+    SYNC.lastPush = Date.now(); cloudLastErr = null; saveSync();
+    if(tab==="settings") render();
+  }).catch(err => {
+    cloudLastErr = (err && err.message) || "failed";
+    cloudRetryT = setTimeout(pushStateToCloud, 60000); // network hiccup, try again in a minute
+    if(tab==="settings") render();
+  });
+}
+function cloudRestore(){
+  if(!syncConfigured()) return toast("Save your worker URL and secret first");
+  toast("Restoring from the cloud");
+  syncFetch("/state").then(res => res.json()).then(parsed => {
+    if(!parsed || typeof parsed!=="object" || !parsed.days) throw new Error("bad backup");
+    S = migrate(parsed);
+    S.lastBackup = Date.now();
+    commit();
+    toast("Restored from the cloud");
+  }).catch(err => {
+    toast(err && err.status===404 ? "No cloud backup saved yet" : "Could not restore from the cloud");
+  });
+}
+function cloudTestPush(){
+  if(!syncConfigured()) return toast("Save your worker URL and secret first");
+  toast("Sending a test push");
+  syncFetch("/test-push", { method:"POST", body:{} }).then(res => res.json()).then(r => {
+    toast(r.ok ? "Sent. Check your phone." : (r.error || "Could not send it"));
+  }).catch(() => toast("Could not reach the worker"));
+}
+
+let PUSH_SUB = null, pushErr = null;
+function refreshPushStatus(){
+  if(!("serviceWorker" in navigator) || !("PushManager" in window)) return;
+  navigator.serviceWorker.ready.then(r => r.pushManager.getSubscription()).then(sub => {
+    PUSH_SUB = sub;
+    if(tab==="settings") render();
+  }).catch(()=>{});
+}
+function enablePush(){
+  pushErr = null;
+  if(isIOS() && !isStandalone()){
+    pushErr = "Add Lock In to your Home Screen first (Share, then Add to Home Screen), then open it from that icon and try again. iOS only allows push for installed apps.";
+    return render();
+  }
+  if(!("serviceWorker" in navigator) || !("PushManager" in window)){
+    pushErr = "This browser does not support push notifications.";
+    return render();
+  }
+  if(!VAPID_PUBLIC_KEY){
+    pushErr = "The app has not been set up with a push key yet.";
+    return render();
+  }
+  if(!syncConfigured()){
+    pushErr = "Save your worker URL and shared secret below first.";
+    return render();
+  }
+  Notification.requestPermission().then(perm => {
+    if(perm!=="granted"){ pushErr = "Notifications were not allowed."; render(); return null; }
+    return navigator.serviceWorker.ready.then(reg => reg.pushManager.getSubscription()).then(existing =>
+      existing || navigator.serviceWorker.ready.then(reg => reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY)
+      }))
+    );
+  }).then(sub => {
+    if(!sub) return;
+    return syncFetch("/subscribe", { method:"POST", body: sub.toJSON() }).then(() => {
+      PUSH_SUB = sub;
+      toast("Push notifications on");
+      render();
+    });
+  }).catch(() => {
+    pushErr = "Could not turn on push notifications.";
+    render();
+  });
+}
+function disablePush(){
+  navigator.serviceWorker.ready.then(reg => reg.pushManager.getSubscription()).then(sub => {
+    if(!sub){ PUSH_SUB = null; toast("Push notifications off"); return render(); }
+    return sub.unsubscribe().then(() => {
+      if(syncConfigured()) syncFetch("/unsubscribe", { method:"POST" }).catch(()=>{});
+      PUSH_SUB = null;
+      toast("Push notifications off");
+      render();
+    });
+  }).catch(() => toast("Could not turn off push notifications"));
+}
+window.addEventListener("online", () => { if(syncConfigured()) pushStateToCloud(); });
 
 /* ---------------------------------------------------------------- */
 /* Scoring                                                           */
@@ -839,6 +991,38 @@ function viewRewards(){
   return html;
 }
 
+function cloudStatusText(){
+  if(!syncConfigured()) return "Not set up yet.";
+  if(cloudLastErr) return "Last attempt failed ("+cloudLastErr+"). Retrying automatically.";
+  if(SYNC.lastPush) return "Last backed up to the cloud: "+new Date(SYNC.lastPush).toLocaleString("en-US",{month:"short",day:"numeric",hour:"numeric",minute:"2-digit"});
+  return "Configured. Backs up automatically as you use the app.";
+}
+
+function viewPushSection(){
+  const supported = ("serviceWorker" in navigator) && ("PushManager" in window);
+  const iosBlocked = isIOS() && !isStandalone();
+  const hasKey = !!VAPID_PUBLIC_KEY;
+  let status, button = "";
+  if(iosBlocked) status = "Add Lock In to your Home Screen first, then open it from that icon.";
+  else if(!supported) status = "This browser does not support push notifications.";
+  else if(!hasKey) status = "Not set up yet, needs a push key in the app.";
+  else if(!syncConfigured()) status = "Set up cloud sync below first.";
+  else if(PUSH_SUB) status = "On";
+  else status = "Off";
+  if(supported && hasKey && !iosBlocked){
+    if(PUSH_SUB) button = '<button class="btn ghost" data-act="disablepush">Turn off</button>';
+    else if(syncConfigured()) button = '<button class="btn" data-act="enablepush">Turn on</button>';
+  }
+  let html = '<section><h2 class="d h">Push notifications</h2>'+
+    '<p class="note">These reach your phone even when Lock In has not been opened all day. They need the cloud sync worker set up in Backup below.</p>'+
+    '<div class="panel"><div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">'+
+    '<div><div class="strong">Push notifications</div><div class="note" style="margin:0">'+esc(status)+'</div></div>'+button+'</div>';
+  if(pushErr) html += '<div class="banner warn" style="margin:10px 0 0">'+esc(pushErr)+'</div>';
+  if(PUSH_SUB) html += '<div class="btns"><button class="btn ghost sm" data-act="cloudtestpush">Send a test</button></div>';
+  html += '</div></section>';
+  return html;
+}
+
 let confirmReset = false;
 function viewSettings(){
   const perm = ("Notification" in window) ? Notification.permission : "unsupported";
@@ -853,6 +1037,8 @@ function viewSettings(){
   if(perm==="granted") html += '<button class="btn ghost" data-act="togglenotify">Turn '+(S.notify?"off":"on")+'</button>';
   else if(perm==="default") html += '<button class="btn" data-act="asknotify">Turn on</button>';
   html += '</div></div></section>';
+
+  html += viewPushSection();
 
   html += '<section><h2 class="d h">Lifting split</h2><p class="note">Sunday starts the cycle. Friday and Saturday are rest.</p><div class="panel">'+
     [0,1,2,3,4].map(function(i){
@@ -900,7 +1086,15 @@ function viewSettings(){
                     : "You have not backed up yet.")+'</div>'+
     '<div class="btns"><button class="btn ghost" data-act="export">Save a backup file</button>'+
     '<button class="btn ghost" data-act="import">Restore from backup</button></div>'+
-    '<input type="file" id="fileIn" accept="application/json" style="display:none"></section>';
+    '<input type="file" id="fileIn" accept="application/json" style="display:none">';
+
+  html += '<div class="panel" style="margin-top:14px"><div class="strong">Cloud sync</div>'+
+    '<p class="note" style="margin:4px 0 10px">Set this up once (see worker/README.md) so a wiped phone is not a wiped year, and so push notifications above have something to check against. Photos never leave this phone.</p>'+
+    '<label class="f">Worker URL<input value="'+esc(SYNC.url||"")+'" placeholder="https://lock-in-sync.your-name.workers.dev" data-act="syncurl" aria-label="Worker URL"></label>'+
+    '<label class="f" style="margin-top:8px">Shared secret<input type="password" value="'+esc(SYNC.secret||"")+'" placeholder="the value you set with wrangler secret put SHARED_SECRET" data-act="syncsecret" aria-label="Shared secret"></label>'+
+    '<div class="note" style="margin-top:10px">'+esc(cloudStatusText())+'</div>'+
+    '<div class="btns"><button class="btn ghost" data-act="cloudbackup">Back up to cloud now</button>'+
+    '<button class="btn ghost" data-act="cloudrestore">Restore from cloud</button></div></div></section>';
 
   html += '<section><h2 class="d h">Start over</h2><p class="note">Erases every habit, meal, point, and reward and puts the defaults back.</p>'+
     '<div class="btns"><button class="btn danger" data-act="reset">'+(confirmReset?"Tap again to erase everything":"Erase all data")+'</button>'+
@@ -1082,6 +1276,12 @@ function onAction(e){
   }
   if(a==="togglenotify"){ S.notify = !S.notify; save(); render(); return toast(S.notify?"Reminders on":"Reminders off"); }
 
+  if(a==="enablepush"){ enablePush(); return; }
+  if(a==="disablepush"){ disablePush(); return; }
+  if(a==="cloudtestpush"){ cloudTestPush(); return; }
+  if(a==="cloudbackup"){ pushStateToCloud().then(()=>toast(cloudLastErr?"Could not reach the cloud":"Backed up to the cloud")); return; }
+  if(a==="cloudrestore"){ cloudRestore(); return; }
+
   if(a==="export"){
     const blob = new Blob([JSON.stringify(S,null,2)],{type:"application/json"});
     const url = URL.createObjectURL(blob);
@@ -1119,6 +1319,12 @@ document.getElementById("view").addEventListener("change", e => {
   const el = e.target.closest("[data-act]");
   if(!el || !("value" in el)) return;
   const a = el.dataset.act, id = el.dataset.id, v = el.value;
+  if(a==="syncurl"||a==="syncsecret"){
+    SYNC[a==="syncurl"?"url":"secret"] = v.trim();
+    saveSync();
+    if(syncConfigured()) queueCloudBackup();
+    return render();
+  }
   const h = () => S.habits.find(x=>x.id===id);
   const bl = () => S.routine.find(x=>x.id===id);
   const map = {
@@ -1234,8 +1440,9 @@ function checkReminders(){
 render();
 checkReminders();
 idb().then(photoLoad).then(list => { PHOTOS = list; if(tab==="gym") render(); }).catch(()=>{});
+refreshPushStatus();
 setInterval(() => { const before = NOW.getMinutes(); NOW = new Date(); checkReminders(); if(NOW.getMinutes()!==before && (tab==="today")) render(); }, 30000);
-document.addEventListener("visibilitychange", () => { if(!document.hidden){ NOW = new Date(); render(); checkReminders(); } });
+document.addEventListener("visibilitychange", () => { if(!document.hidden){ NOW = new Date(); render(); checkReminders(); if(syncConfigured()) pushStateToCloud(); } });
 
 if("serviceWorker" in navigator){
   window.addEventListener("load", () => { navigator.serviceWorker.register("sw.js").catch(()=>{}); });

@@ -1,0 +1,29 @@
+name = "lock-in-sync"
+main = "src/index.js"
+compatibility_date = "2026-09-12"
+
+# Runs the reminder check every 15 minutes.
+[triggers]
+crons = ["*/15 * * * *"]
+
+# One KV namespace holds three things, all small: the one push subscription,
+# the one backed-up app state blob, and a short-lived per-day "already
+# pushed this habit" record. Create it with:
+#   npx wrangler kv namespace create LOCKIN_KV
+# then paste the id it prints below.
+[[kv_namespaces]]
+binding = "LOCKIN_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# Not secret: the VAPID public key is meant to be public (it also goes in
+# index.html), and the subject is just a contact URL/email that push
+# services may use if a server misbehaves. It does not need to be a real
+# address, and this file is committed to a public repo, so a throwaway
+# value is fine.
+[vars]
+VAPID_SUBJECT = "mailto:lockin-app@example.invalid"
+VAPID_PUBLIC_KEY = "BGVrlFWKzmiei0LhmeVQ0m63Ip4QBGh3qxWgfB96SxzITe_4ko83rpD4xJvFlHtkxPxlDuaoq2gzBw6HX1SiS5k"
+
+# Secret, never put here: VAPID_PRIVATE_KEY and SHARED_SECRET.
+# Set with `npx wrangler secret put VAPID_PRIVATE_KEY` and
+# `npx wrangler secret put SHARED_SECRET`.

@@ -1,4 +1,4 @@
-const CACHE = "lockin-v1";
+const CACHE = "lockin-v2";
 const ASSETS = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", e => {
@@ -26,6 +26,19 @@ self.addEventListener("fetch", e => {
         return res;
       })
       .catch(() => caches.match(e.request).then(hit => hit || caches.match("./index.html")))
+  );
+});
+
+// Arrives even when the app has not been opened all day: the sync worker's
+// cron trigger sends this when a habit goes past due and is still unchecked.
+self.addEventListener("push", e => {
+  let data = {};
+  try { data = e.data ? e.data.json() : {}; }
+  catch (err) { data = { title: "Lock In", body: e.data ? e.data.text() : "" }; }
+  const title = data.title || "Lock In";
+  const body = data.body || "";
+  e.waitUntil(
+    self.registration.showNotification(title, { body, icon: "icon-192.png", badge: "icon-192.png", tag: "lockin-push" })
   );
 });
 
